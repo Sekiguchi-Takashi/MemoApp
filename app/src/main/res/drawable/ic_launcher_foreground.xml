@@ -1,0 +1,15 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- 白いメモ用紙 -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M34,26 h40 a4,4 0 0 1 4,4 v48 a4,4 0 0 1 -4,4 h-40 a4,4 0 0 1 -4,-4 v-48 a4,4 0 0 1 4,-4 z"/>
+    <!-- 罫線 -->
+    <path android:strokeColor="#90A4AE" android:strokeWidth="2"
+        android:pathData="M38,40 h32 M38,50 h32 M38,60 h32 M38,70 h20"/>
+    <!-- 鉛筆 -->
+    <path android:fillColor="#FBC02D"
+        android:pathData="M62,66 l14,-14 6,6 -14,14 -7,1 z"/>
+    <path android:fillColor="#5D4037"
+        android:pathData="M62,66 l3,6 -4,1 z"/>
+</vector>
