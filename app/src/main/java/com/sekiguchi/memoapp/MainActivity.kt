@@ -4,8 +4,15 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
@@ -15,8 +22,10 @@ import android.provider.OpenableColumns
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.util.Base64
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -26,17 +35,20 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.security.MessageDigest
 
 class MainActivity : Activity() {
 
-    // ---------- 画面1(エディタ) ----------
+    // ---------- 画面1(テキストページ) ----------
     private lateinit var screen1Root: LinearLayout
     private lateinit var editor: EditText
     private lateinit var fileLabel: TextView
@@ -47,8 +59,10 @@ class MainActivity : Activity() {
 
     private val REQ_OPEN = 1
     private val REQ_SAVE_AS = 2
+    private val REQ_OPEN_IMG = 3
+    private val REQ_SAVE_IMG = 4
 
-    // ---------- 保持スロット ----------
+    // ---------- 保持スロット(テキスト) ----------
     private val SLOTS = 10
     private val ST_EMPTY = 0
     private val ST_HELD = 1
@@ -71,6 +85,12 @@ class MainActivity : Activity() {
     private var deleteMode3 = false
     private var revealed = -1
     private val checks3 = HashMap<Int, CheckBox>()
+
+    // ---------- 画面4(手書きページ) ----------
+    private var screen4Root: LinearLayout? = null
+    private lateinit var drawView: DrawView
+    private var drawUri: Uri? = null
+    private val DRAW_SLOTS = 5
 
     private var currentScreen = 1
 
@@ -98,8 +118,8 @@ class MainActivity : Activity() {
 
         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row1.addView(makeButton("開く") { confirmIfDirty { pickOpen() } })
-        row1.addView(makeButton("上書き保存") { save() })
-        row1.addView(makeButton("名前をつけて保存") { pickSaveAs() })
+        row1.addView(makeButton("保存") { saveMenu() })
+        row1.addView(makeButton("手書き") { showScreen(4) })
         screen1Root.addView(row1)
 
         val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -135,6 +155,17 @@ class MainActivity : Activity() {
 
     private fun updateLabel() {
         fileLabel.text = if (dirty) "$currentName *" else currentName
+    }
+
+    // --- 保存ボタン: 上書き/名前をつけて を選択 ---
+    private fun saveMenu() {
+        AlertDialog.Builder(this)
+            .setTitle("保存方法を選択")
+            .setItems(arrayOf("上書き保存", "名前をつけて保存")) { _, which ->
+                if (which == 0) save() else pickSaveAs()
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
     }
 
     private fun pickOpen() {
@@ -201,6 +232,26 @@ class MainActivity : Activity() {
                 currentName = queryName(uri)
                 save()
             }
+            REQ_OPEN_IMG -> {
+                try {
+                    val bmp = contentResolver.openInputStream(uri)?.use {
+                        BitmapFactory.decodeStream(it)
+                    }
+                    if (bmp != null) {
+                        drawView.setImage(bmp)
+                        drawUri = uri
+                        Toast.makeText(this, "画像を読み込みました。上から手書きできます", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "画像を読み込めませんでした", Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(this, "開けませんでした: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            REQ_SAVE_IMG -> {
+                drawUri = uri
+                writeDrawing(uri)
+            }
         }
     }
 
@@ -229,13 +280,15 @@ class MainActivity : Activity() {
                         font-family:sans-serif;font-size:13pt;line-height:1.6;">$escaped</pre>
             </body></html>
         """.trimIndent()
+        printHtml(html, currentName.removeSuffix(".txt"))
+    }
 
+    private fun printHtml(html: String, jobName: String) {
         val webView = WebView(this)
         printWebView = webView
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String) {
                 val pm = getSystemService(PRINT_SERVICE) as PrintManager
-                val jobName = currentName.removeSuffix(".txt")
                 pm.print(
                     jobName,
                     view.createPrintDocumentAdapter(jobName),
@@ -338,7 +391,6 @@ class MainActivity : Activity() {
             val btn = rowBtns[i]!!
             val edit = rowEdits[i]!!
 
-            // チェックボックス: 削除モード中の「保持」行のみ(機密行は画面2から削除不可)
             if (deleteMode2 && slot.state == ST_HELD) {
                 cb.visibility = View.VISIBLE
             } else {
@@ -385,7 +437,6 @@ class MainActivity : Activity() {
         Toast.makeText(this, "コピーしました", Toast.LENGTH_SHORT).show()
     }
 
-    // --- 保持ボタン: 入力済みの空欄行を固定化 ---
     private fun holdRows() {
         var count = 0
         for (i in 0 until SLOTS) {
@@ -407,7 +458,6 @@ class MainActivity : Activity() {
         refreshRows2()
     }
 
-    // --- 削除ボタン(画面2) ---
     private fun deleteAction2() {
         if (!deleteMode2) {
             if (slots.none { it.state == ST_HELD }) {
@@ -437,11 +487,9 @@ class MainActivity : Activity() {
         slots[i].state = ST_EMPTY
         slots[i].text = ""
         rowEdits[i]?.setText("")
-        // 機密行がすべて無くなったらパスワードもリセット(次回は新規設定)
         if (slots.none { it.state == ST_SECRET }) pwHash = null
     }
 
-    // --- 機密ボタン: 1行のみ機密登録 ---
     private fun secretAction() {
         val candidates = (0 until SLOTS).filter {
             slots[it].state == ST_EMPTY && rowEdits[it]!!.text.toString().isNotBlank()
@@ -460,7 +508,6 @@ class MainActivity : Activity() {
             else -> {
                 val i = candidates[0]
                 if (pwHash == null) {
-                    // 1回目: パスワード設定(保存/キャンセル)
                     inputDialog(
                         title = "パスワード設定",
                         message = "4桁の数字を入力してください",
@@ -476,7 +523,6 @@ class MainActivity : Activity() {
                         }
                     }
                 } else {
-                    // 2回目以降: パスワード確認
                     inputDialog(
                         title = "パスワード確認",
                         message = "登録済みの4桁パスワードを入力してください",
@@ -503,7 +549,6 @@ class MainActivity : Activity() {
         Toast.makeText(this, "保持${i + 1}を機密登録しました", Toast.LENGTH_SHORT).show()
     }
 
-    // --- 機密情報ボタン: 画面3への入口 ---
     private fun secretInfoAction(i: Int) {
         inputDialog(
             title = "パスワード入力",
@@ -523,7 +568,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // --- 完全削除: パスワード不要、Delete入力で初期化 ---
     private fun hardDeleteConfirm(i: Int) {
         inputDialog(
             title = "完全削除の確認",
@@ -641,14 +685,245 @@ class MainActivity : Activity() {
                     saveSlots()
                     Toast.makeText(this, "${count}行を初期化しました", Toast.LENGTH_SHORT).show()
                 }
-                showScreen(3) // 再構築
+                showScreen(3)
             }
         }
 
         return root
     }
 
-    // ================= 画面切替・保存 =================
+    // ================= 画面4(手書きページ) =================
+    private fun buildScreen4(): LinearLayout {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 16, 16, 16)
+        }
+
+        val title = TextView(this).apply {
+            text = "手書きページ"
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(8, 4, 8, 12)
+        }
+        root.addView(title)
+
+        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row1.addView(makeButton("開く") { pickOpenImage() })
+        row1.addView(makeButton("保存") { drawSaveMenu() })
+        row1.addView(makeButton("テキスト") { showScreen(1) })
+        root.addView(row1)
+
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row2.addView(makeButton("印刷") { printDrawing() })
+        row2.addView(makeButton("保持") { holdDrawing() })
+        row2.addView(makeButton("初期化") { clearDrawingConfirm() })
+        root.addView(row2)
+
+        drawView = DrawView(this)
+        root.addView(drawView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        return root
+    }
+
+    private fun pickOpenImage() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+        }
+        startActivityForResult(intent, REQ_OPEN_IMG)
+    }
+
+    private fun drawSaveMenu() {
+        if (!drawView.hasContent) {
+            Toast.makeText(this, "手書きスペースが空です", Toast.LENGTH_SHORT).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("保存方法を選択")
+            .setItems(arrayOf("上書き保存", "名前をつけて保存")) { _, which ->
+                if (which == 0) {
+                    val uri = drawUri
+                    if (uri == null) pickSaveImage() else writeDrawing(uri)
+                } else {
+                    pickSaveImage()
+                }
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
+    }
+
+    private fun pickSaveImage() {
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/png"
+            putExtra(Intent.EXTRA_TITLE, "tegaki.png")
+        }
+        startActivityForResult(intent, REQ_SAVE_IMG)
+    }
+
+    private fun writeDrawing(uri: Uri) {
+        try {
+            val bmp = drawView.getBitmap() ?: return
+            contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            Toast.makeText(this, "保存しました", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "保存に失敗: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun printDrawing() {
+        val bmp = drawView.getBitmap()
+        if (bmp == null || !drawView.hasContent) {
+            Toast.makeText(this, "手書きスペースが空です", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val baos = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, baos)
+        val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+        val html = """
+            <html><body style="margin:0;">
+            <img style="width:100%;" src="data:image/png;base64,$b64"/>
+            </body></html>
+        """.trimIndent()
+        printHtml(html, "手書き")
+    }
+
+    private fun clearDrawingConfirm() {
+        if (!drawView.hasContent) return
+        AlertDialog.Builder(this)
+            .setMessage("手書きの内容を消去します。よろしいですか?")
+            .setPositiveButton("初期化") { _, _ ->
+                drawView.clear()
+                drawUri = null
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
+    }
+
+    private fun drawHoldFile(i: Int) = File(filesDir, "draw_hold_$i.png")
+
+    private fun holdDrawing() {
+        if (!drawView.hasContent) {
+            Toast.makeText(this, "手書きスペースが空です", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val free = (0 until DRAW_SLOTS).firstOrNull { !drawHoldFile(it).exists() }
+        if (free == null) {
+            AlertDialog.Builder(this)
+                .setTitle("エラー")
+                .setMessage("手書きの保持は5つまでです。保持画面で不要なものを削除してください。")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        try {
+            val bmp = drawView.getBitmap() ?: return
+            drawHoldFile(free).outputStream().use { out ->
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            Toast.makeText(this, "保持${free + 1}に保存しました", Toast.LENGTH_SHORT).show()
+            showScreen(5)
+        } catch (e: Exception) {
+            Toast.makeText(this, "保持に失敗: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // ================= 画面5(手書き保持ページ) =================
+    private fun buildScreen5(): LinearLayout {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 16, 16, 16)
+        }
+
+        val title = TextView(this).apply {
+            text = "手書き保持ページ"
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(8, 4, 8, 12)
+        }
+        root.addView(title)
+
+        val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btnRow.addView(makeButton("戻る") { showScreen(4) })
+        root.addView(btnRow)
+
+        val scroll = ScrollView(this)
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 12, 0, 12)
+        }
+
+        for (i in 0 until DRAW_SLOTS) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 8, 0, 8)
+            }
+
+            val label = TextView(this).apply {
+                text = "保持${i + 1}"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(4, 0, 8, 0)
+            }
+            row.addView(label)
+
+            val f = drawHoldFile(i)
+            if (f.exists()) {
+                val img = ImageView(this).apply {
+                    val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+                    setImageBitmap(BitmapFactory.decodeFile(f.absolutePath, opts))
+                    setBackgroundColor(Color.parseColor("#EEEEEE"))
+                    adjustViewBounds = true
+                }
+                row.addView(img, LinearLayout.LayoutParams(0, 300, 1f))
+
+                val delBtn = Button(this).apply {
+                    text = "削除"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    minWidth = 0; minimumWidth = 0
+                    setPadding(20, 0, 20, 0)
+                    setOnClickListener {
+                        f.delete()
+                        showScreen(5)
+                        Toast.makeText(this@MainActivity, "保持${i + 1}を削除しました", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                row.addView(delBtn, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+
+                val moveBtn = Button(this).apply {
+                    text = "移す"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    minWidth = 0; minimumWidth = 0
+                    setPadding(20, 0, 20, 0)
+                    setOnClickListener {
+                        val bmp = BitmapFactory.decodeFile(f.absolutePath)
+                        if (bmp != null) {
+                            drawView.setImage(bmp)
+                            showScreen(4)
+                            Toast.makeText(this@MainActivity, "保持${i + 1}を手書き画面に移しました", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+                row.addView(moveBtn, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            } else {
+                val empty = TextView(this).apply {
+                    text = "（空き）"
+                    setTextColor(Color.parseColor("#9E9E9E"))
+                    setPadding(8, 24, 8, 24)
+                }
+                row.addView(empty, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            }
+
+            list.addView(row)
+        }
+
+        scroll.addView(list)
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        return root
+    }
+
+    // ================= 画面切替・共通 =================
     private fun showScreen(n: Int) {
         currentScreen = n
         when (n) {
@@ -659,12 +934,18 @@ class MainActivity : Activity() {
                 setContentView(screen2Root)
             }
             3 -> setContentView(buildScreen3())
+            4 -> {
+                if (screen4Root == null) screen4Root = buildScreen4()
+                setContentView(screen4Root)
+            }
+            5 -> setContentView(buildScreen5())
         }
     }
 
     override fun onBackPressed() {
         when (currentScreen) {
-            2, 3 -> showScreen(1)
+            2, 3, 4 -> showScreen(1)
+            5 -> showScreen(4)
             else -> confirmIfDirty { super.onBackPressed() }
         }
     }
@@ -733,5 +1014,97 @@ class MainActivity : Activity() {
                 slots[i].text = o.getString("t")
             }
         } catch (_: Exception) { }
+    }
+
+    // ================= 手書きビュー =================
+    class DrawView(context: Context) : View(context) {
+        private var bmp: Bitmap? = null
+        private var bmpCanvas: Canvas? = null
+        private var pending: Bitmap? = null
+        private val path = Path()
+        private var lastX = 0f
+        private var lastY = 0f
+        var hasContent = false
+            private set
+
+        private val strokePaint = Paint().apply {
+            color = Color.BLACK
+            strokeWidth = 6f
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            isAntiAlias = true
+        }
+        private val bmpPaint = Paint(Paint.DITHER_FLAG)
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            if (w <= 0 || h <= 0) return
+            if (bmp == null) {
+                bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bmpCanvas = Canvas(bmp!!)
+                bmpCanvas!!.drawColor(Color.WHITE)
+            }
+            applyPending()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            bmp?.let { canvas.drawBitmap(it, 0f, 0f, bmpPaint) }
+            canvas.drawPath(path, strokePaint)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            val x = event.x
+            val y = event.y
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    path.moveTo(x, y)
+                    lastX = x; lastY = y
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    path.quadTo(lastX, lastY, (x + lastX) / 2, (y + lastY) / 2)
+                    lastX = x; lastY = y
+                }
+                MotionEvent.ACTION_UP -> {
+                    path.lineTo(x, y)
+                    bmpCanvas?.drawPath(path, strokePaint)
+                    path.reset()
+                    hasContent = true
+                }
+                else -> return false
+            }
+            invalidate()
+            return true
+        }
+
+        fun clear() {
+            path.reset()
+            bmpCanvas?.drawColor(Color.WHITE)
+            hasContent = false
+            invalidate()
+        }
+
+        fun getBitmap(): Bitmap? = bmp
+
+        fun setImage(src: Bitmap) {
+            pending = src
+            if (bmpCanvas != null) applyPending() else invalidate()
+        }
+
+        private fun applyPending() {
+            val p = pending ?: return
+            val c = bmpCanvas ?: return
+            pending = null
+            c.drawColor(Color.WHITE)
+            val scale = minOf(width.toFloat() / p.width, height.toFloat() / p.height)
+            val w = p.width * scale
+            val h = p.height * scale
+            val left = (width - w) / 2f
+            val top = (height - h) / 2f
+            c.drawBitmap(p, null, RectF(left, top, left + w, top + h), null)
+            hasContent = true
+            invalidate()
+        }
     }
 }
