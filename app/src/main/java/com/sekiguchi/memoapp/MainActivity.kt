@@ -20,6 +20,7 @@ import android.print.PrintAttributes
 import android.print.PrintManager
 import android.provider.OpenableColumns
 import android.text.Editable
+import android.text.InputFilter
 import android.text.InputType
 import android.text.TextWatcher
 import android.util.Base64
@@ -56,6 +57,9 @@ class MainActivity : Activity() {
     private var currentName: String = "無題"
     private var dirty = false
     private var printWebView: WebView? = null
+
+    // 本文の最大文字数(1万行を十分に超える余裕を確保)
+    private val MAX_CHARS = 2_000_000
 
     private val REQ_OPEN = 1
     private val REQ_SAVE_AS = 2
@@ -111,7 +115,7 @@ class MainActivity : Activity() {
         fileLabel = TextView(this).apply {
             text = currentName
             setTypeface(null, Typeface.BOLD)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setPadding(8, 4, 8, 12)
         }
         screen1Root.addView(fileLabel)
@@ -134,6 +138,21 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             setPadding(24, 24, 24, 24)
             hint = "ここに文書を貼り付けて編集できます"
+
+            // --- 長文対応の設定 ---
+            // 複数行入力を明示し、行数の上限を撤廃
+            inputType = InputType.TYPE_CLASS_TEXT or
+                    InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            isSingleLine = false
+            setHorizontallyScrolling(false)
+            minLines = 1
+            maxLines = Integer.MAX_VALUE
+            // 文字数上限を明示的に大きく取る(既定の制限に引っかからないようにする)
+            filters = arrayOf(InputFilter.LengthFilter(MAX_CHARS))
+            isVerticalScrollBarEnabled = true
+            // 長文で重くなる原因になる自動修正/候補表示を無効化
+            isVerticalFadingEdgeEnabled = false
         }
         editor.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -153,11 +172,15 @@ class MainActivity : Activity() {
         }
     }
 
+    // ファイル名 + 行数/文字数を表示
     private fun updateLabel() {
-        fileLabel.text = if (dirty) "$currentName *" else currentName
+        val text = editor.text
+        var lines = 1
+        for (i in 0 until text.length) if (text[i] == '\n') lines++
+        val mark = if (dirty) " *" else ""
+        fileLabel.text = "$currentName$mark   ${lines}行 / ${text.length}文字"
     }
 
-    // --- 保存ボタン: 上書き/名前をつけて を選択 ---
     private fun saveMenu() {
         AlertDialog.Builder(this)
             .setTitle("保存方法を選択")
@@ -218,6 +241,10 @@ class MainActivity : Activity() {
                     val text = contentResolver.openInputStream(uri)?.use {
                         it.readBytes().toString(Charsets.UTF_8)
                     } ?: ""
+                    if (text.length > MAX_CHARS) {
+                        Toast.makeText(this, "ファイルが大きすぎます(${MAX_CHARS}文字まで)", Toast.LENGTH_LONG).show()
+                        return
+                    }
                     editor.setText(text)
                     currentUri = uri
                     currentName = queryName(uri)
@@ -370,7 +397,12 @@ class MainActivity : Activity() {
 
             val edit = EditText(this).apply {
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                inputType = InputType.TYPE_CLASS_TEXT or
+                        InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                        InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                isSingleLine = false
                 maxLines = 3
+                filters = arrayOf(InputFilter.LengthFilter(MAX_CHARS))
                 hint = "ここに貼り付け"
             }
             rowEdits[i] = edit
