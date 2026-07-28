@@ -1,11 +1,15 @@
 package com.sekiguchi.memoapp
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -15,7 +19,10 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.print.PrintAttributes
 import android.print.PrintManager
 import android.provider.OpenableColumns
@@ -46,6 +53,9 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : Activity() {
 
@@ -58,13 +68,14 @@ class MainActivity : Activity() {
     private var dirty = false
     private var printWebView: WebView? = null
 
-    // 本文の最大文字数(1万行を十分に超える余裕を確保)
     private val MAX_CHARS = 2_000_000
 
     private val REQ_OPEN = 1
     private val REQ_SAVE_AS = 2
     private val REQ_OPEN_IMG = 3
     private val REQ_SAVE_IMG = 4
+    private val REQ_VOICE_DIR = 5
+    private val REQ_PERM = 100
 
     // ---------- 保持スロット(テキスト) ----------
     private val SLOTS = 10
@@ -96,6 +107,24 @@ class MainActivity : Activity() {
     private var drawUri: Uri? = null
     private val DRAW_SLOTS = 5
 
+    // ---------- 画面6(ボイスページ) ----------
+    private var voiceStatusText: TextView? = null
+    private var pendingMinutes = -1
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val tick = object : Runnable {
+        override fun run() {
+            if (currentScreen == 6) {
+                updateVoiceStatus()
+                uiHandler.postDelayed(this, 500)
+            }
+        }
+    }
+    private val recordReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (currentScreen == 6) showScreen(6)
+        }
+    }
+
     private var currentScreen = 1
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -103,6 +132,19 @@ class MainActivity : Activity() {
         loadSlots()
         buildScreen1()
         showScreen(1)
+
+        val filter = IntentFilter(RecordService.BROADCAST)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(recordReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(recordReceiver, filter)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { unregisterReceiver(recordReceiver) } catch (_: Exception) { }
     }
 
     // ================= 画面1 =================
@@ -112,24 +154,31 @@ class MainActivity : Activity() {
             setPadding(16, 16, 16, 16)
         }
 
+        // ヘッダー: ファイル名(左) + 手書き/ボイス(右・色付き)
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         fileLabel = TextView(this).apply {
             text = currentName
             setTypeface(null, Typeface.BOLD)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             setPadding(8, 4, 8, 12)
         }
-        screen1Root.addView(fileLabel)
+        header.addView(fileLabel, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        header.addView(makeColorButton("手書き", Color.parseColor("#1565C0")) { showScreen(4) })
+        header.addView(makeColorButton("ボイス", Color.parseColor("#C62828")) { openVoice() })
+        screen1Root.addView(header)
 
         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row1.addView(makeButton("開く") { confirmIfDirty { pickOpen() } })
         row1.addView(makeButton("保存") { saveMenu() })
-        row1.addView(makeButton("手書き") { showScreen(4) })
+        row1.addView(makeButton("印刷") { printMemo() })
         screen1Root.addView(row1)
 
         val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row2.addView(makeButton("印刷") { printMemo() })
         row2.addView(makeButton("保持") { showScreen(2) })
-        row2.addView(makeButton("閉じる") { confirmIfDirty { finish() } })
+        row2.addView(makeButton("クリア") { clearConfirm() })
         screen1Root.addView(row2)
 
         editor = EditText(this).apply {
@@ -138,9 +187,6 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             setPadding(24, 24, 24, 24)
             hint = "ここに文書を貼り付けて編集できます"
-
-            // --- 長文対応の設定 ---
-            // 複数行入力を明示し、行数の上限を撤廃
             inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                     InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -148,10 +194,8 @@ class MainActivity : Activity() {
             setHorizontallyScrolling(false)
             minLines = 1
             maxLines = Integer.MAX_VALUE
-            // 文字数上限を明示的に大きく取る(既定の制限に引っかからないようにする)
             filters = arrayOf(InputFilter.LengthFilter(MAX_CHARS))
             isVerticalScrollBarEnabled = true
-            // 長文で重くなる原因になる自動修正/候補表示を無効化
             isVerticalFadingEdgeEnabled = false
         }
         editor.addTextChangedListener(object : TextWatcher {
@@ -172,13 +216,43 @@ class MainActivity : Activity() {
         }
     }
 
-    // ファイル名 + 行数/文字数を表示
+    private fun makeColorButton(label: String, bg: Int, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(Color.WHITE)
+            setBackgroundColor(bg)
+            setOnClickListener { onClick() }
+            val lp = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+            lp.marginStart = 12
+            layoutParams = lp
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(28, 8, 28, 8)
+        }
+    }
+
     private fun updateLabel() {
         val text = editor.text
         var lines = 1
         for (i in 0 until text.length) if (text[i] == '\n') lines++
         val mark = if (dirty) " *" else ""
         fileLabel.text = "$currentName$mark   ${lines}行 / ${text.length}文字"
+    }
+
+    private fun clearConfirm() {
+        AlertDialog.Builder(this)
+            .setTitle("クリア")
+            .setMessage("画面の内容をすべて消去します。よろしいですか?")
+            .setPositiveButton("クリア") { _, _ ->
+                editor.setText("")
+                currentUri = null
+                currentName = "無題"
+                dirty = false
+                updateLabel()
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
     }
 
     private fun saveMenu() {
@@ -228,6 +302,25 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != RESULT_OK) return
         val uri = data?.data ?: return
+
+        if (requestCode == REQ_VOICE_DIR) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: Exception) { }
+            getSharedPreferences(RecordService.PREFS, MODE_PRIVATE).edit()
+                .putString(RecordService.KEY_DIR, uri.toString()).apply()
+            Toast.makeText(this, "保存先を設定しました", Toast.LENGTH_SHORT).show()
+            if (pendingMinutes >= 0) {
+                val m = pendingMinutes
+                pendingMinutes = -1
+                actuallyStart(m)
+            }
+            return
+        }
+
         try {
             contentResolver.takePersistableUriPermission(
                 uri,
@@ -955,6 +1048,221 @@ class MainActivity : Activity() {
         return root
     }
 
+    // ================= 画面6(ボイスページ) =================
+    private fun openVoice() {
+        if (!hasMicPermission()) { requestVoicePerms(); return }
+        showScreen(6)
+    }
+
+    private fun hasMicPermission(): Boolean =
+        checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun requestVoicePerms() {
+        val perms = if (Build.VERSION.SDK_INT >= 33)
+            arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+        else
+            arrayOf(Manifest.permission.RECORD_AUDIO)
+        requestPermissions(perms, REQ_PERM)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_PERM) {
+            if (hasMicPermission()) {
+                showScreen(6)
+            } else {
+                Toast.makeText(this, "録音にはマイク権限が必要です", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun buildScreen6(): LinearLayout {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 16, 16, 16)
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val title = TextView(this).apply {
+            text = "ボイスレコード"
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(8, 4, 8, 8)
+        }
+        header.addView(title, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        val backBtn = Button(this).apply {
+            text = "戻る"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setOnClickListener { showScreen(1) }
+            layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+        }
+        header.addView(backBtn)
+        root.addView(header)
+
+        voiceStatusText = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setTypeface(null, Typeface.BOLD)
+            setPadding(8, 12, 8, 16)
+        }
+        root.addView(voiceStatusText)
+
+        val ctrlRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        ctrlRow.addView(makeColorButton("スタート", Color.parseColor("#2E7D32")) { startRec(60) })
+        ctrlRow.addView(makeColorButton("ストップ", Color.parseColor("#C62828")) { stopRec() })
+        root.addView(ctrlRow)
+
+        val timeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 12, 0, 4)
+        }
+        timeRow.addView(makeButton("1分") { startRec(1) })
+        timeRow.addView(makeButton("5分") { startRec(5) })
+        timeRow.addView(makeButton("15分") { startRec(15) })
+        timeRow.addView(makeButton("60分") { startRec(60) })
+        root.addView(timeRow)
+
+        val histTitle = TextView(this).apply {
+            text = "保存履歴（1日で自動クリア）"
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(8, 20, 8, 8)
+        }
+        root.addView(histTitle)
+
+        val scroll = ScrollView(this)
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 4, 0, 4)
+        }
+
+        val entries = loadHistoryPruned()
+        if (entries.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = "履歴はありません"
+                setTextColor(Color.parseColor("#9E9E9E"))
+                setPadding(8, 12, 8, 12)
+            })
+        }
+        val fmt = SimpleDateFormat("MM/dd HH:mm", Locale.JAPAN)
+        for (e in entries) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 6, 0, 6)
+            }
+            val tv = TextView(this).apply {
+                text = "${fmt.format(Date(e.getLong("t")))}  ${e.getString("n")}"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(8, 0, 8, 0)
+            }
+            row.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+
+            val playBtn = Button(this).apply {
+                text = "再生"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                minWidth = 0; minimumWidth = 0
+                setPadding(20, 0, 20, 0)
+                setOnClickListener {
+                    try {
+                        val play = Intent(Intent.ACTION_VIEW)
+                        play.setDataAndType(Uri.parse(e.getString("u")), "audio/mp4")
+                        play.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        startActivity(play)
+                    } catch (ex: Exception) {
+                        Toast.makeText(this@MainActivity, "再生アプリが見つかりません", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            row.addView(playBtn, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+
+            list.addView(row)
+        }
+
+        scroll.addView(list)
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+
+        updateVoiceStatus()
+        return root
+    }
+
+    private fun updateVoiceStatus() {
+        val tv = voiceStatusText ?: return
+        if (RecordService.isRecording) {
+            val sec = ((System.currentTimeMillis() - RecordService.startTime) / 1000).toInt()
+            val mm = sec / 60
+            val ss = sec % 60
+            tv.text = "● 録音中  %02d:%02d".format(mm, ss)
+            tv.setTextColor(Color.parseColor("#C62828"))
+        } else {
+            tv.text = "停止中"
+            tv.setTextColor(Color.parseColor("#37474F"))
+        }
+    }
+
+    private fun startRec(minutes: Int) {
+        if (RecordService.isRecording) {
+            Toast.makeText(this, "すでに録音中です", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!hasMicPermission()) { requestVoicePerms(); return }
+        val dir = getSharedPreferences(RecordService.PREFS, MODE_PRIVATE)
+            .getString(RecordService.KEY_DIR, null)
+        if (dir == null) {
+            pendingMinutes = minutes
+            Toast.makeText(this, "録音の保存先フォルダを選んでください", Toast.LENGTH_LONG).show()
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_VOICE_DIR)
+            return
+        }
+        actuallyStart(minutes)
+    }
+
+    private fun actuallyStart(minutes: Int) {
+        val i = Intent(this, RecordService::class.java).apply {
+            action = RecordService.ACTION_START
+            putExtra(RecordService.EXTRA_MINUTES, minutes)
+        }
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        Toast.makeText(this, "録音を開始しました（最大${minutes}分）", Toast.LENGTH_SHORT).show()
+        uiHandler.postDelayed({ updateVoiceStatus() }, 300)
+    }
+
+    private fun stopRec() {
+        if (!RecordService.isRecording) {
+            Toast.makeText(this, "録音していません", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val i = Intent(this, RecordService::class.java).apply { action = RecordService.ACTION_STOP }
+        startService(i)
+        Toast.makeText(this, "停止して保存します", Toast.LENGTH_SHORT).show()
+    }
+
+    // 履歴を読み込み、1日以上前の項目を除去して書き戻す
+    private fun loadHistoryPruned(): List<JSONObject> {
+        val sp = getSharedPreferences(RecordService.PREFS, MODE_PRIVATE)
+        val raw = sp.getString(RecordService.KEY_HIST, "[]")
+        val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
+        val kept = JSONArray()
+        val out = ArrayList<JSONObject>()
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                if (o.getLong("t") >= cutoff) {
+                    kept.put(o)
+                    out.add(o)
+                }
+            }
+        } catch (_: Exception) { }
+        sp.edit().putString(RecordService.KEY_HIST, kept.toString()).apply()
+        out.sortByDescending { it.getLong("t") }
+        return out
+    }
+
     // ================= 画面切替・共通 =================
     private fun showScreen(n: Int) {
         currentScreen = n
@@ -971,12 +1279,17 @@ class MainActivity : Activity() {
                 setContentView(screen4Root)
             }
             5 -> setContentView(buildScreen5())
+            6 -> {
+                setContentView(buildScreen6())
+                uiHandler.removeCallbacks(tick)
+                uiHandler.post(tick)
+            }
         }
     }
 
     override fun onBackPressed() {
         when (currentScreen) {
-            2, 3, 4 -> showScreen(1)
+            2, 3, 4, 6 -> showScreen(1)
             5 -> showScreen(4)
             else -> confirmIfDirty { super.onBackPressed() }
         }
