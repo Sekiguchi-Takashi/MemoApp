@@ -75,6 +75,8 @@ class MainActivity : Activity() {
     private val REQ_OPEN_IMG = 3
     private val REQ_SAVE_IMG = 4
     private val REQ_VOICE_DIR = 5
+    private val REQ_MD_OPEN = 6
+    private val REQ_MD_SAVE = 7
     private val REQ_PERM = 100
 
     // ---------- 保持スロット(テキスト) ----------
@@ -125,11 +127,27 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- 画面7/8/9(AI: プロジェクト管理・MCP管理) ----------
+    private val PROJECTS = 5
+    private val MCPS = 5
+    private val PLAN_MAX = 1000
+    private val COMMENT_MAX = 20
+
+    class Project(var name: String = "", var policy: String = "", var plan: String = "")
+
+    private val projects = Array(PROJECTS) { Project() }
+    private val mcpNames = Array(MCPS) { "" }
+    private val mcpComments = Array(MCPS) { "" }
+    private var editIndex = -1
+    private var viewIndex = -1
+    private var pendingMcpSlot = -1
+
     private var currentScreen = 1
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         loadSlots()
+        loadAi()
         buildScreen1()
         showScreen(1)
 
@@ -167,6 +185,7 @@ class MainActivity : Activity() {
         }
         header.addView(fileLabel, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         header.addView(makeColorButton("手書き", Color.parseColor("#1565C0")) { showScreen(4) })
+        header.addView(makeColorButton("AI", Color.parseColor("#6A1B9A")) { showScreen(7) })
         header.addView(makeColorButton("ボイス", Color.parseColor("#C62828")) { openVoice() })
         screen1Root.addView(header)
 
@@ -224,11 +243,11 @@ class MainActivity : Activity() {
             setBackgroundColor(bg)
             setOnClickListener { onClick() }
             val lp = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
-            lp.marginStart = 12
+            lp.marginStart = 8
             layoutParams = lp
             minWidth = 0
             minimumWidth = 0
-            setPadding(28, 8, 28, 8)
+            setPadding(18, 8, 18, 8)
         }
     }
 
@@ -371,6 +390,40 @@ class MainActivity : Activity() {
             REQ_SAVE_IMG -> {
                 drawUri = uri
                 writeDrawing(uri)
+            }
+            REQ_MD_OPEN -> {
+                val slot = pendingMcpSlot
+                pendingMcpSlot = -1
+                if (slot < 0) return
+                try {
+                    val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    if (bytes == null) {
+                        Toast.makeText(this, "ファイルを読み込めませんでした", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    mcpFile(slot).outputStream().use { it.write(bytes) }
+                    mcpNames[slot] = queryName(uri)
+                    saveAi()
+                    showScreen(7)
+                    Toast.makeText(this, "MCP${slot + 1}に保存しました", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "保存に失敗: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            REQ_MD_SAVE -> {
+                val slot = pendingMcpSlot
+                pendingMcpSlot = -1
+                if (slot < 0) return
+                try {
+                    val f = mcpFile(slot)
+                    if (!f.exists()) return
+                    contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                        f.inputStream().use { input -> input.copyTo(out) }
+                    }
+                    Toast.makeText(this, "ダウンロードしました", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "ダウンロードに失敗: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
@@ -1263,6 +1316,444 @@ class MainActivity : Activity() {
         return out
     }
 
+    // ================= 画面7(AI: プロジェクト + MCP) =================
+    private fun mcpFile(i: Int) = File(filesDir, "mcp_$i.md")
+
+    private fun buildScreen7(): LinearLayout {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 16, 16, 16)
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val title = TextView(this).apply {
+            text = "AI"
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(8, 4, 8, 8)
+        }
+        header.addView(title, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        val backBtn = Button(this).apply {
+            text = "戻る"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setOnClickListener { showScreen(1) }
+            layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+        }
+        header.addView(backBtn)
+        root.addView(header)
+
+        val scroll = ScrollView(this)
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 4, 0, 8)
+        }
+
+        list.addView(sectionLabel("プロジェクト"))
+        for (i in 0 until PROJECTS) list.addView(projectRow(i))
+
+        list.addView(sectionLabel("MCP"))
+        for (i in 0 until MCPS) list.addView(mcpBlock(i))
+
+        scroll.addView(list)
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        return root
+    }
+
+    private fun sectionLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        setTypeface(null, Typeface.BOLD)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        setTextColor(Color.parseColor("#37474F"))
+        setPadding(8, 20, 8, 8)
+    }
+
+    private fun smallButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
+        text = label
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        minWidth = 0; minimumWidth = 0
+        setPadding(20, 0, 20, 0)
+        setOnClickListener { onClick() }
+        layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+    }
+
+    private fun projectRow(i: Int): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 6, 0, 6)
+        }
+        val p = projects[i]
+        val registered = p.name.isNotBlank()
+
+        val tv = TextView(this).apply {
+            text = if (registered) p.name else "プロジェクト${i + 1}（未登録）"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(if (registered) Color.BLACK else Color.parseColor("#9E9E9E"))
+            setPadding(8, 0, 8, 0)
+        }
+        row.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+
+        if (registered) {
+            row.addView(smallButton("閲覧") { viewIndex = i; showScreen(9) })
+            row.addView(smallButton("編集") { editIndex = i; showScreen(8) })
+        } else {
+            row.addView(smallButton("登録") { editIndex = i; showScreen(8) })
+        }
+        return row
+    }
+
+    private fun mcpBlock(i: Int): LinearLayout {
+        val block = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 8, 0, 8)
+        }
+        val registered = mcpNames[i].isNotBlank() && mcpFile(i).exists()
+
+        if (!registered) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val tv = TextView(this).apply {
+                text = "MCP${i + 1}（未登録）"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(Color.parseColor("#9E9E9E"))
+                setPadding(8, 0, 8, 0)
+            }
+            row.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            row.addView(smallButton("保存") { pickMd(i) })
+            block.addView(row)
+            return block
+        }
+
+        // コメント欄（20文字まで）— 保存メッセージの上に配置
+        val comment = EditText(this).apply {
+            setText(mcpComments[i])
+            hint = "コメント（20文字まで）"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT
+            filters = arrayOf(InputFilter.LengthFilter(COMMENT_MAX))
+            setPadding(8, 4, 8, 4)
+        }
+        comment.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                mcpComments[i] = s?.toString() ?: ""
+                saveAi()
+            }
+        })
+        block.addView(comment)
+
+        // 保存メッセージ + 操作ボタン
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 4, 0, 0)
+        }
+        val msg = TextView(this).apply {
+            text = "MCP${i + 1}: ${mcpNames[i]} を保存済み"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(Color.parseColor("#37474F"))
+            setPadding(8, 0, 8, 0)
+        }
+        row.addView(msg, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        row.addView(smallButton("DL") { downloadMd(i) })
+        row.addView(smallButton("削除") { deleteMcpConfirm(i) })
+        block.addView(row)
+        return block
+    }
+
+    private fun pickMd(i: Int) {
+        pendingMcpSlot = i
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("text/markdown", "text/plain", "text/*"))
+        }
+        startActivityForResult(intent, REQ_MD_OPEN)
+    }
+
+    private fun downloadMd(i: Int) {
+        if (!mcpFile(i).exists()) {
+            Toast.makeText(this, "ファイルがありません", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingMcpSlot = i
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/markdown"
+            putExtra(Intent.EXTRA_TITLE, mcpNames[i].ifBlank { "mcp_${i + 1}.md" })
+        }
+        startActivityForResult(intent, REQ_MD_SAVE)
+    }
+
+    private fun deleteMcpConfirm(i: Int) {
+        AlertDialog.Builder(this)
+            .setTitle("削除の確認")
+            .setMessage("MCP${i + 1}「${mcpNames[i]}」とコメントを削除します。よろしいですか?")
+            .setPositiveButton("削除") { _, _ ->
+                mcpFile(i).delete()
+                mcpNames[i] = ""
+                mcpComments[i] = ""
+                saveAi()
+                showScreen(7)
+                Toast.makeText(this, "MCP${i + 1}を削除しました", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
+    }
+
+    // ================= 画面8(プロジェクト登録・編集) =================
+    private fun buildScreen8(): LinearLayout {
+        val i = editIndex
+        val p = if (i in 0 until PROJECTS) projects[i] else Project()
+        val registered = p.name.isNotBlank()
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 16, 16, 16)
+        }
+
+        val title = TextView(this).apply {
+            text = if (registered) "プロジェクト編集" else "プロジェクト登録"
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(8, 4, 8, 12)
+        }
+        root.addView(title)
+
+        val nameEdit = EditText(this).apply {
+            setText(p.name)
+            hint = "プロジェクト名"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
+        val policyEdit = EditText(this).apply {
+            setText(p.policy)
+            hint = "方針（文字数制限なし）"
+            gravity = Gravity.TOP or Gravity.START
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setBackgroundColor(Color.parseColor("#FFFDF5"))
+            setPadding(16, 16, 16, 16)
+            inputType = InputType.TYPE_CLASS_TEXT or
+                    InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            isSingleLine = false
+            setHorizontallyScrolling(false)
+            minLines = 4
+            maxLines = Integer.MAX_VALUE
+        }
+        val planLabel = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(Color.parseColor("#616161"))
+            setPadding(8, 12, 8, 4)
+        }
+        val planEdit = EditText(this).apply {
+            setText(p.plan)
+            hint = "計画（1000文字まで）"
+            gravity = Gravity.TOP or Gravity.START
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setBackgroundColor(Color.parseColor("#FFFDF5"))
+            setPadding(16, 16, 16, 16)
+            inputType = InputType.TYPE_CLASS_TEXT or
+                    InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                    InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            isSingleLine = false
+            setHorizontallyScrolling(false)
+            minLines = 4
+            maxLines = Integer.MAX_VALUE
+            filters = arrayOf(InputFilter.LengthFilter(PLAN_MAX))
+        }
+        planLabel.text = "計画  ${planEdit.text.length} / $PLAN_MAX 文字"
+        planEdit.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                planLabel.text = "計画  ${s?.length ?: 0} / $PLAN_MAX 文字"
+            }
+        })
+
+        val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btnRow.addView(makeButton("保存") {
+            val n = nameEdit.text.toString().trim()
+            if (i !in 0 until PROJECTS) {
+                showScreen(7)
+            } else if (n.isBlank()) {
+                Toast.makeText(this, "プロジェクト名を入力してください", Toast.LENGTH_SHORT).show()
+            } else {
+                projects[i].name = n
+                projects[i].policy = policyEdit.text.toString()
+                projects[i].plan = planEdit.text.toString()
+                saveAi()
+                showScreen(7)
+                Toast.makeText(this, "保存しました", Toast.LENGTH_SHORT).show()
+            }
+        })
+        btnRow.addView(makeButton("戻る") { showScreen(7) })
+        if (registered) {
+            btnRow.addView(makeButton("削除") { deleteProjectConfirm(i) })
+        }
+        root.addView(btnRow)
+
+        val scroll = ScrollView(this)
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 12, 0, 12)
+        }
+        form.addView(TextView(this).apply {
+            text = "プロジェクト名"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(Color.parseColor("#616161"))
+            setPadding(8, 0, 8, 4)
+        })
+        form.addView(nameEdit)
+        form.addView(TextView(this).apply {
+            text = "方針"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(Color.parseColor("#616161"))
+            setPadding(8, 12, 8, 4)
+        })
+        form.addView(policyEdit)
+        form.addView(planLabel)
+        form.addView(planEdit)
+        scroll.addView(form)
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        return root
+    }
+
+    private fun deleteProjectConfirm(i: Int) {
+        AlertDialog.Builder(this)
+            .setTitle("削除の確認")
+            .setMessage("プロジェクト「${projects[i].name}」を削除します。よろしいですか?")
+            .setPositiveButton("削除") { _, _ ->
+                projects[i].name = ""
+                projects[i].policy = ""
+                projects[i].plan = ""
+                saveAi()
+                showScreen(7)
+                Toast.makeText(this, "削除しました", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
+    }
+
+    // ================= 画面9(プロジェクト閲覧) =================
+    private fun buildScreen9(): LinearLayout {
+        val i = viewIndex
+        val p = if (i in 0 until PROJECTS) projects[i] else Project()
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 16, 16, 16)
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val title = TextView(this).apply {
+            text = p.name
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(8, 4, 8, 8)
+        }
+        header.addView(title, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        val backBtn = Button(this).apply {
+            text = "戻る"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setOnClickListener { showScreen(7) }
+            layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+        }
+        header.addView(backBtn)
+        root.addView(header)
+
+        val scroll = ScrollView(this)
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 8, 0, 12)
+        }
+        body.addView(TextView(this).apply {
+            text = "方針"
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(Color.parseColor("#616161"))
+            setPadding(8, 8, 8, 4)
+        })
+        body.addView(TextView(this).apply {
+            text = p.policy.ifBlank { "（未記入）" }
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextIsSelectable(true)
+            setBackgroundColor(Color.parseColor("#FFFDF5"))
+            setPadding(16, 16, 16, 16)
+        })
+        body.addView(TextView(this).apply {
+            text = "計画"
+            setTypeface(null, Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(Color.parseColor("#616161"))
+            setPadding(8, 16, 8, 4)
+        })
+        body.addView(TextView(this).apply {
+            text = p.plan.ifBlank { "（未記入）" }
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextIsSelectable(true)
+            setBackgroundColor(Color.parseColor("#FFFDF5"))
+            setPadding(16, 16, 16, 16)
+        })
+        scroll.addView(body)
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        return root
+    }
+
+    // ---------- AI関連の永続化 ----------
+    private fun saveAi() {
+        val pArr = JSONArray()
+        projects.forEach {
+            pArr.put(JSONObject().put("n", it.name).put("po", it.policy).put("pl", it.plan))
+        }
+        val mArr = JSONArray()
+        for (i in 0 until MCPS) {
+            mArr.put(JSONObject().put("n", mcpNames[i]).put("c", mcpComments[i]))
+        }
+        getSharedPreferences("ai", MODE_PRIVATE).edit()
+            .putString("projects", pArr.toString())
+            .putString("mcp", mArr.toString())
+            .apply()
+    }
+
+    private fun loadAi() {
+        val sp = getSharedPreferences("ai", MODE_PRIVATE)
+        try {
+            val raw = sp.getString("projects", null)
+            if (raw != null) {
+                val arr = JSONArray(raw)
+                for (i in 0 until minOf(arr.length(), PROJECTS)) {
+                    val o = arr.getJSONObject(i)
+                    projects[i].name = o.optString("n", "")
+                    projects[i].policy = o.optString("po", "")
+                    projects[i].plan = o.optString("pl", "")
+                }
+            }
+        } catch (_: Exception) { }
+        try {
+            val raw = sp.getString("mcp", null)
+            if (raw != null) {
+                val arr = JSONArray(raw)
+                for (i in 0 until minOf(arr.length(), MCPS)) {
+                    val o = arr.getJSONObject(i)
+                    mcpNames[i] = o.optString("n", "")
+                    mcpComments[i] = o.optString("c", "")
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
     // ================= 画面切替・共通 =================
     private fun showScreen(n: Int) {
         currentScreen = n
@@ -1284,13 +1775,17 @@ class MainActivity : Activity() {
                 uiHandler.removeCallbacks(tick)
                 uiHandler.post(tick)
             }
+            7 -> setContentView(buildScreen7())
+            8 -> setContentView(buildScreen8())
+            9 -> setContentView(buildScreen9())
         }
     }
 
     override fun onBackPressed() {
         when (currentScreen) {
-            2, 3, 4, 6 -> showScreen(1)
+            2, 3, 4, 6, 7 -> showScreen(1)
             5 -> showScreen(4)
+            8, 9 -> showScreen(7)
             else -> confirmIfDirty { super.onBackPressed() }
         }
     }
