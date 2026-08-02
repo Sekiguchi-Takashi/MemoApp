@@ -128,12 +128,28 @@ class MainActivity : Activity() {
     }
 
     // ---------- 画面7/8/9(AI: プロジェクト管理・MCP管理) ----------
-    private val PROJECTS = 5
+    private val PROJECTS = 20
     private val MCPS = 5
     private val PLAN_MAX = 1000
     private val COMMENT_MAX = 20
 
-    class Project(var name: String = "", var policy: String = "", var plan: String = "")
+    // ステータス: 0=未着手 1=推進 2=テスト中 3=完了
+    private val STATUS_NAMES = arrayOf("未着手", "推進", "テスト中", "完了")
+    private val STATUS_COLORS = intArrayOf(
+        Color.parseColor("#9E9E9E"),
+        Color.parseColor("#1565C0"),
+        Color.parseColor("#EF6C00"),
+        Color.parseColor("#2E7D32")
+    )
+
+    class Project(
+        var name: String = "",
+        var policy: String = "",
+        var plan: String = "",
+        var status: Int = 0
+    )
+
+    private var projectFilter = -1
 
     private val projects = Array(PROJECTS) { Project() }
     private val mcpNames = Array(MCPS) { "" }
@@ -1352,7 +1368,49 @@ class MainActivity : Activity() {
         }
 
         list.addView(sectionLabel("プロジェクト"))
-        for (i in 0 until PROJECTS) list.addView(projectRow(i))
+        list.addView(filterRow())
+
+        val registered = (0 until PROJECTS).filter { projects[it].name.isNotBlank() }
+        val shown =
+            if (projectFilter < 0) registered
+            else registered.filter { projects[it].status == projectFilter }
+
+        if (shown.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = if (registered.isEmpty()) "登録されたプロジェクトはありません"
+                       else "この状態のプロジェクトはありません"
+                setTextColor(Color.parseColor("#9E9E9E"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(8, 12, 8, 12)
+            })
+        }
+        for (i in shown) list.addView(projectRow(i))
+
+        val free = (0 until PROJECTS).firstOrNull { projects[it].name.isBlank() }
+        val freeCount = (0 until PROJECTS).count { projects[it].name.isBlank() }
+        val addRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 10, 0, 4)
+        }
+        val addInfo = TextView(this).apply {
+            text = "登録済み ${registered.size} / $PROJECTS 件"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(Color.parseColor("#616161"))
+            setPadding(8, 0, 8, 0)
+        }
+        addRow.addView(addInfo, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        if (free != null) {
+            addRow.addView(smallButton("新規登録") { editIndex = free; showScreen(8) })
+        } else {
+            addRow.addView(TextView(this).apply {
+                text = "空き枠なし"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(Color.parseColor("#9E9E9E"))
+                setPadding(8, 0, 8, 0)
+            })
+        }
+        list.addView(addRow)
 
         list.addView(sectionLabel("MCP"))
         for (i in 0 until MCPS) list.addView(mcpBlock(i))
@@ -1379,6 +1437,37 @@ class MainActivity : Activity() {
         layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
     }
 
+    private fun filterRow(): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 0, 0, 4)
+        }
+        fun chip(label: String, value: Int) {
+            val selected = (projectFilter == value)
+            val b = Button(this).apply {
+                text = label
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                minWidth = 0; minimumWidth = 0
+                setPadding(4, 0, 4, 0)
+                if (selected) {
+                    setBackgroundColor(
+                        if (value < 0) Color.parseColor("#37474F") else STATUS_COLORS[value]
+                    )
+                    setTextColor(Color.WHITE)
+                }
+                setOnClickListener {
+                    projectFilter = value
+                    showScreen(7)
+                }
+                layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+            }
+            row.addView(b)
+        }
+        chip("すべて", -1)
+        for (s in 0 until STATUS_NAMES.size) chip(STATUS_NAMES[s], s)
+        return row
+    }
+
     private fun projectRow(i: Int): LinearLayout {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1386,23 +1475,41 @@ class MainActivity : Activity() {
             setPadding(0, 6, 0, 6)
         }
         val p = projects[i]
-        val registered = p.name.isNotBlank()
+
+        val statusBtn = Button(this).apply {
+            text = STATUS_NAMES[p.status]
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setTextColor(Color.WHITE)
+            setBackgroundColor(STATUS_COLORS[p.status])
+            minWidth = 0; minimumWidth = 0
+            setPadding(12, 0, 12, 0)
+            setOnClickListener { pickStatus(i) }
+            layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+        }
+        row.addView(statusBtn)
 
         val tv = TextView(this).apply {
-            text = if (registered) p.name else "プロジェクト${i + 1}（未登録）"
+            text = p.name
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            setTextColor(if (registered) Color.BLACK else Color.parseColor("#9E9E9E"))
             setPadding(8, 0, 8, 0)
         }
         row.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
 
-        if (registered) {
-            row.addView(smallButton("閲覧") { viewIndex = i; showScreen(9) })
-            row.addView(smallButton("編集") { editIndex = i; showScreen(8) })
-        } else {
-            row.addView(smallButton("登録") { editIndex = i; showScreen(8) })
-        }
+        row.addView(smallButton("閲覧") { viewIndex = i; showScreen(9) })
+        row.addView(smallButton("編集") { editIndex = i; showScreen(8) })
         return row
+    }
+
+    private fun pickStatus(i: Int) {
+        AlertDialog.Builder(this)
+            .setTitle("状態を選択")
+            .setItems(STATUS_NAMES) { _, which ->
+                projects[i].status = which
+                saveAi()
+                showScreen(7)
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
     }
 
     private fun mcpBlock(i: Int): LinearLayout {
@@ -1579,6 +1686,38 @@ class MainActivity : Activity() {
             }
         })
 
+        val statusHolder = intArrayOf(p.status)
+        val statusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 4, 0, 0)
+        }
+        val statusBtns = arrayOfNulls<Button>(STATUS_NAMES.size)
+        fun paintStatus() {
+            for (s in STATUS_NAMES.indices) {
+                val b = statusBtns[s] ?: continue
+                if (statusHolder[0] == s) {
+                    b.setBackgroundColor(STATUS_COLORS[s])
+                    b.setTextColor(Color.WHITE)
+                } else {
+                    b.setBackgroundColor(Color.parseColor("#E0E0E0"))
+                    b.setTextColor(Color.parseColor("#37474F"))
+                }
+            }
+        }
+        for (s in STATUS_NAMES.indices) {
+            val b = Button(this).apply {
+                text = STATUS_NAMES[s]
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                minWidth = 0; minimumWidth = 0
+                setPadding(4, 0, 4, 0)
+                setOnClickListener { statusHolder[0] = s; paintStatus() }
+                layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+            }
+            statusBtns[s] = b
+            statusRow.addView(b)
+        }
+        paintStatus()
+
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btnRow.addView(makeButton("保存") {
             val n = nameEdit.text.toString().trim()
@@ -1590,6 +1729,7 @@ class MainActivity : Activity() {
                 projects[i].name = n
                 projects[i].policy = policyEdit.text.toString()
                 projects[i].plan = planEdit.text.toString()
+                projects[i].status = statusHolder[0]
                 saveAi()
                 showScreen(7)
                 Toast.makeText(this, "保存しました", Toast.LENGTH_SHORT).show()
@@ -1613,6 +1753,13 @@ class MainActivity : Activity() {
             setPadding(8, 0, 8, 4)
         })
         form.addView(nameEdit)
+        form.addView(TextView(this).apply {
+            text = "状態"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(Color.parseColor("#616161"))
+            setPadding(8, 12, 8, 4)
+        })
+        form.addView(statusRow)
         form.addView(TextView(this).apply {
             text = "方針"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -1664,6 +1811,13 @@ class MainActivity : Activity() {
             setPadding(8, 4, 8, 8)
         }
         header.addView(title, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        header.addView(TextView(this).apply {
+            text = STATUS_NAMES[p.status]
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(Color.WHITE)
+            setBackgroundColor(STATUS_COLORS[p.status])
+            setPadding(16, 6, 16, 6)
+        })
         val backBtn = Button(this).apply {
             text = "戻る"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
@@ -1715,7 +1869,10 @@ class MainActivity : Activity() {
     private fun saveAi() {
         val pArr = JSONArray()
         projects.forEach {
-            pArr.put(JSONObject().put("n", it.name).put("po", it.policy).put("pl", it.plan))
+            pArr.put(
+                JSONObject().put("n", it.name).put("po", it.policy)
+                    .put("pl", it.plan).put("st", it.status)
+            )
         }
         val mArr = JSONArray()
         for (i in 0 until MCPS) {
@@ -1738,6 +1895,7 @@ class MainActivity : Activity() {
                     projects[i].name = o.optString("n", "")
                     projects[i].policy = o.optString("po", "")
                     projects[i].plan = o.optString("pl", "")
+                    projects[i].status = o.optInt("st", 0).coerceIn(0, STATUS_NAMES.size - 1)
                 }
             }
         } catch (_: Exception) { }
