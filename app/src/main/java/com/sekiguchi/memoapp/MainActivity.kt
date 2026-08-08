@@ -127,11 +127,14 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- 画面7/8/9(AI: プロジェクト管理・MCP管理) ----------
-    private val PROJECTS = 20
-    private val MCPS = 5
+    // ---------- 画面7/8/9(AI: プロジェクト管理) ----------
+    private val PROJECTS = 30
     private val PLAN_MAX = 1000
-    private val COMMENT_MAX = 20
+
+    // MDファイル種別: 0=オントロジー 1=使い方
+    private val MD_ONTO = 0
+    private val MD_USAGE = 1
+    private val MD_LABELS = arrayOf("オントロジー", "使い方")
 
     // ステータス: 0=未着手 1=推進 2=テスト中 3=完了
     private val STATUS_NAMES = arrayOf("未着手", "推進", "テスト中", "完了")
@@ -146,17 +149,21 @@ class MainActivity : Activity() {
         var name: String = "",
         var policy: String = "",
         var plan: String = "",
-        var status: Int = 0
+        var status: Int = 0,
+        var ontoName: String = "",
+        var usageName: String = ""
     )
 
     private var projectFilter = -1
 
     private val projects = Array(PROJECTS) { Project() }
-    private val mcpNames = Array(MCPS) { "" }
-    private val mcpComments = Array(MCPS) { "" }
     private var editIndex = -1
     private var viewIndex = -1
-    private var pendingMcpSlot = -1
+    private var pendingMdProject = -1
+    private var pendingMdKind = -1
+    private var mdEditIndex = -1
+    private var ontoRowHolder: LinearLayout? = null
+    private var usageRowHolder: LinearLayout? = null
 
     private var currentScreen = 1
 
@@ -200,8 +207,11 @@ class MainActivity : Activity() {
             setPadding(8, 4, 8, 12)
         }
         header.addView(fileLabel, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        header.addView(makeColorButton("手書き", Color.parseColor("#1565C0")) { showScreen(4) })
         header.addView(makeColorButton("AI", Color.parseColor("#6A1B9A")) { showScreen(7) })
+        header.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(24, 1)
+        })
+        header.addView(makeColorButton("手書き", Color.parseColor("#1565C0")) { showScreen(4) })
         header.addView(makeColorButton("ボイス", Color.parseColor("#C62828")) { openVoice() })
         screen1Root.addView(header)
 
@@ -408,30 +418,35 @@ class MainActivity : Activity() {
                 writeDrawing(uri)
             }
             REQ_MD_OPEN -> {
-                val slot = pendingMcpSlot
-                pendingMcpSlot = -1
-                if (slot < 0) return
+                val prj = pendingMdProject
+                val kind = pendingMdKind
+                pendingMdProject = -1
+                pendingMdKind = -1
+                if (prj < 0 || kind < 0) return
                 try {
                     val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
                     if (bytes == null) {
                         Toast.makeText(this, "ファイルを読み込めませんでした", Toast.LENGTH_LONG).show()
                         return
                     }
-                    mcpFile(slot).outputStream().use { it.write(bytes) }
-                    mcpNames[slot] = queryName(uri)
+                    mdFile(prj, kind).outputStream().use { it.write(bytes) }
+                    val nm = queryName(uri)
+                    if (kind == MD_ONTO) projects[prj].ontoName = nm else projects[prj].usageName = nm
                     saveAi()
-                    showScreen(7)
-                    Toast.makeText(this, "MCP${slot + 1}に保存しました", Toast.LENGTH_SHORT).show()
+                    refreshMdRow(kind)
+                    Toast.makeText(this, "${MD_LABELS[kind]}を保存しました", Toast.LENGTH_SHORT).show()
                 } catch (e: Exception) {
                     Toast.makeText(this, "保存に失敗: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
             REQ_MD_SAVE -> {
-                val slot = pendingMcpSlot
-                pendingMcpSlot = -1
-                if (slot < 0) return
+                val prj = pendingMdProject
+                val kind = pendingMdKind
+                pendingMdProject = -1
+                pendingMdKind = -1
+                if (prj < 0 || kind < 0) return
                 try {
-                    val f = mcpFile(slot)
+                    val f = mdFile(prj, kind)
                     if (!f.exists()) return
                     contentResolver.openOutputStream(uri, "wt")?.use { out ->
                         f.inputStream().use { input -> input.copyTo(out) }
@@ -1332,8 +1347,9 @@ class MainActivity : Activity() {
         return out
     }
 
-    // ================= 画面7(AI: プロジェクト + MCP) =================
-    private fun mcpFile(i: Int) = File(filesDir, "mcp_$i.md")
+    // ================= 画面7(AI: プロジェクト) =================
+    private fun mdFile(prj: Int, kind: Int) =
+        File(filesDir, if (kind == MD_ONTO) "proj_${prj}_onto.md" else "proj_${prj}_usage.md")
 
     private fun buildScreen7(): LinearLayout {
         val root = LinearLayout(this).apply {
@@ -1411,9 +1427,6 @@ class MainActivity : Activity() {
             })
         }
         list.addView(addRow)
-
-        list.addView(sectionLabel("MCP"))
-        for (i in 0 until MCPS) list.addView(mcpBlock(i))
 
         scroll.addView(list)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -1512,71 +1525,45 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun mcpBlock(i: Int): LinearLayout {
-        val block = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 8, 0, 8)
-        }
-        val registered = mcpNames[i].isNotBlank() && mcpFile(i).exists()
+    // ---------- MDファイル行(オントロジー / 使い方) ----------
+    private fun mdHolder(kind: Int): LinearLayout? =
+        if (kind == MD_ONTO) ontoRowHolder else usageRowHolder
 
-        if (!registered) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            val tv = TextView(this).apply {
-                text = "MCP${i + 1}（未登録）"
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                setTextColor(Color.parseColor("#9E9E9E"))
-                setPadding(8, 0, 8, 0)
-            }
-            row.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            row.addView(smallButton("保存") { pickMd(i) })
-            block.addView(row)
-            return block
-        }
+    private fun mdName(prj: Int, kind: Int): String =
+        if (kind == MD_ONTO) projects[prj].ontoName else projects[prj].usageName
 
-        // コメント欄（20文字まで）— 保存メッセージの上に配置
-        val comment = EditText(this).apply {
-            setText(mcpComments[i])
-            hint = "コメント（20文字まで）"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            isSingleLine = true
-            inputType = InputType.TYPE_CLASS_TEXT
-            filters = arrayOf(InputFilter.LengthFilter(COMMENT_MAX))
-            setPadding(8, 4, 8, 4)
-        }
-        comment.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun afterTextChanged(s: Editable?) {
-                mcpComments[i] = s?.toString() ?: ""
-                saveAi()
-            }
-        })
-        block.addView(comment)
-
-        // 保存メッセージ + 操作ボタン
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 4, 0, 0)
-        }
-        val msg = TextView(this).apply {
-            text = "MCP${i + 1}: ${mcpNames[i]} を保存済み"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTextColor(Color.parseColor("#37474F"))
-            setPadding(8, 0, 8, 0)
-        }
-        row.addView(msg, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        row.addView(smallButton("DL") { downloadMd(i) })
-        row.addView(smallButton("削除") { deleteMcpConfirm(i) })
-        block.addView(row)
-        return block
+    private fun refreshMdRow(kind: Int) {
+        if (currentScreen == 8) fillMdRow(kind)
     }
 
-    private fun pickMd(i: Int) {
-        pendingMcpSlot = i
+    private fun fillMdRow(kind: Int) {
+        val holder = mdHolder(kind) ?: return
+        val prj = mdEditIndex
+        holder.removeAllViews()
+        if (prj !in 0 until PROJECTS) return
+
+        val name = mdName(prj, kind)
+        val exists = name.isNotBlank() && mdFile(prj, kind).exists()
+
+        val tv = TextView(this).apply {
+            text = if (exists) name else "未アップロード"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(if (exists) Color.parseColor("#37474F") else Color.parseColor("#9E9E9E"))
+            setPadding(8, 0, 8, 0)
+        }
+        holder.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+
+        if (exists) {
+            holder.addView(smallButton("DL") { downloadMd(prj, kind) })
+            holder.addView(smallButton("削除") { deleteMdConfirm(prj, kind) })
+        } else {
+            holder.addView(smallButton("アップロード") { pickMd(prj, kind) })
+        }
+    }
+
+    private fun pickMd(prj: Int, kind: Int) {
+        pendingMdProject = prj
+        pendingMdKind = kind
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
@@ -1585,31 +1572,31 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQ_MD_OPEN)
     }
 
-    private fun downloadMd(i: Int) {
-        if (!mcpFile(i).exists()) {
+    private fun downloadMd(prj: Int, kind: Int) {
+        if (!mdFile(prj, kind).exists()) {
             Toast.makeText(this, "ファイルがありません", Toast.LENGTH_SHORT).show()
             return
         }
-        pendingMcpSlot = i
+        pendingMdProject = prj
+        pendingMdKind = kind
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "text/markdown"
-            putExtra(Intent.EXTRA_TITLE, mcpNames[i].ifBlank { "mcp_${i + 1}.md" })
+            putExtra(Intent.EXTRA_TITLE, mdName(prj, kind).ifBlank { "${MD_LABELS[kind]}.md" })
         }
         startActivityForResult(intent, REQ_MD_SAVE)
     }
 
-    private fun deleteMcpConfirm(i: Int) {
+    private fun deleteMdConfirm(prj: Int, kind: Int) {
         AlertDialog.Builder(this)
             .setTitle("削除の確認")
-            .setMessage("MCP${i + 1}「${mcpNames[i]}」とコメントを削除します。よろしいですか?")
+            .setMessage("${MD_LABELS[kind]}「${mdName(prj, kind)}」を削除します。よろしいですか?")
             .setPositiveButton("削除") { _, _ ->
-                mcpFile(i).delete()
-                mcpNames[i] = ""
-                mcpComments[i] = ""
+                mdFile(prj, kind).delete()
+                if (kind == MD_ONTO) projects[prj].ontoName = "" else projects[prj].usageName = ""
                 saveAi()
-                showScreen(7)
-                Toast.makeText(this, "MCP${i + 1}を削除しました", Toast.LENGTH_SHORT).show()
+                fillMdRow(kind)
+                Toast.makeText(this, "${MD_LABELS[kind]}を削除しました", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("キャンセル", null)
             .show()
@@ -1663,7 +1650,7 @@ class MainActivity : Activity() {
         }
         val planEdit = EditText(this).apply {
             setText(p.plan)
-            hint = "計画（1000文字まで）"
+            hint = "進捗（1000文字まで）"
             gravity = Gravity.TOP or Gravity.START
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             setBackgroundColor(Color.parseColor("#FFFDF5"))
@@ -1677,12 +1664,12 @@ class MainActivity : Activity() {
             maxLines = Integer.MAX_VALUE
             filters = arrayOf(InputFilter.LengthFilter(PLAN_MAX))
         }
-        planLabel.text = "計画  ${planEdit.text.length} / $PLAN_MAX 文字"
+        planLabel.text = "進捗  ${planEdit.text.length} / $PLAN_MAX 文字"
         planEdit.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun afterTextChanged(s: Editable?) {
-                planLabel.text = "計画  ${s?.length ?: 0} / $PLAN_MAX 文字"
+                planLabel.text = "進捗  ${s?.length ?: 0} / $PLAN_MAX 文字"
             }
         })
 
@@ -1769,6 +1756,25 @@ class MainActivity : Activity() {
         form.addView(policyEdit)
         form.addView(planLabel)
         form.addView(planEdit)
+
+        for (kind in MD_LABELS.indices) {
+            form.addView(TextView(this).apply {
+                text = MD_LABELS[kind]
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(Color.parseColor("#616161"))
+                setPadding(8, 16, 8, 4)
+            })
+            val holder = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            if (kind == MD_ONTO) ontoRowHolder = holder else usageRowHolder = holder
+            form.addView(holder)
+        }
+        mdEditIndex = i
+        fillMdRow(MD_ONTO)
+        fillMdRow(MD_USAGE)
+
         scroll.addView(form)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         return root
@@ -1779,9 +1785,13 @@ class MainActivity : Activity() {
             .setTitle("削除の確認")
             .setMessage("プロジェクト「${projects[i].name}」を削除します。よろしいですか?")
             .setPositiveButton("削除") { _, _ ->
+                mdFile(i, MD_ONTO).delete()
+                mdFile(i, MD_USAGE).delete()
                 projects[i].name = ""
                 projects[i].policy = ""
                 projects[i].plan = ""
+                projects[i].ontoName = ""
+                projects[i].usageName = ""
                 saveAi()
                 showScreen(7)
                 Toast.makeText(this, "削除しました", Toast.LENGTH_SHORT).show()
@@ -1847,7 +1857,7 @@ class MainActivity : Activity() {
             setPadding(16, 16, 16, 16)
         })
         body.addView(TextView(this).apply {
-            text = "計画"
+            text = "進捗"
             setTypeface(null, Typeface.BOLD)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setTextColor(Color.parseColor("#616161"))
@@ -1860,6 +1870,30 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#FFFDF5"))
             setPadding(16, 16, 16, 16)
         })
+        for (kind in MD_LABELS.indices) {
+            body.addView(TextView(this).apply {
+                text = MD_LABELS[kind]
+                setTypeface(null, Typeface.BOLD)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextColor(Color.parseColor("#616161"))
+                setPadding(8, 16, 8, 4)
+            })
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val has = i in 0 until PROJECTS &&
+                    mdName(i, kind).isNotBlank() && mdFile(i, kind).exists()
+            row.addView(TextView(this).apply {
+                text = if (has) mdName(i, kind) else "未アップロード"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextColor(if (has) Color.parseColor("#37474F") else Color.parseColor("#9E9E9E"))
+                setPadding(8, 0, 8, 0)
+            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            if (has) row.addView(smallButton("DL") { downloadMd(i, kind) })
+            body.addView(row)
+        }
+
         scroll.addView(body)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         return root
@@ -1872,15 +1906,11 @@ class MainActivity : Activity() {
             pArr.put(
                 JSONObject().put("n", it.name).put("po", it.policy)
                     .put("pl", it.plan).put("st", it.status)
+                    .put("on", it.ontoName).put("us", it.usageName)
             )
-        }
-        val mArr = JSONArray()
-        for (i in 0 until MCPS) {
-            mArr.put(JSONObject().put("n", mcpNames[i]).put("c", mcpComments[i]))
         }
         getSharedPreferences("ai", MODE_PRIVATE).edit()
             .putString("projects", pArr.toString())
-            .putString("mcp", mArr.toString())
             .apply()
     }
 
@@ -1896,17 +1926,8 @@ class MainActivity : Activity() {
                     projects[i].policy = o.optString("po", "")
                     projects[i].plan = o.optString("pl", "")
                     projects[i].status = o.optInt("st", 0).coerceIn(0, STATUS_NAMES.size - 1)
-                }
-            }
-        } catch (_: Exception) { }
-        try {
-            val raw = sp.getString("mcp", null)
-            if (raw != null) {
-                val arr = JSONArray(raw)
-                for (i in 0 until minOf(arr.length(), MCPS)) {
-                    val o = arr.getJSONObject(i)
-                    mcpNames[i] = o.optString("n", "")
-                    mcpComments[i] = o.optString("c", "")
+                    projects[i].ontoName = o.optString("on", "")
+                    projects[i].usageName = o.optString("us", "")
                 }
             }
         } catch (_: Exception) { }
